@@ -10,6 +10,11 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { BrevoClient } = require('@getbrevo/brevo');
+const multer = require('multer');
+const kycUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }
+});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -61,6 +66,12 @@ db.exec(`
   );
 `);
 
+// Add KYC columns to users (idempotent)
+const kycCols = ['kyc_status','kyc_name','kyc_id_type','kyc_id_number','kyc_submitted_at'];
+kycCols.forEach(col => {
+  const exists = db.prepare("SELECT COUNT(*) as c FROM pragma_table_info('users') WHERE name=?").get(col).c > 0;
+  if(!exists) db.exec(`ALTER TABLE users ADD COLUMN ${col} TEXT`);
+});
 console.log('✅ Database ready (biertex.db)');
 
 /* ============================================================
@@ -115,6 +126,51 @@ async function sendEmail({ to, toName, subject, html }) {
     htmlContent: html,
     sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
     to: [{ email: to, name: toName }]
+  });
+}
+function kycEmailHTML(user, kycData) {
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
+      <div style="text-align:center;margin-bottom:24px">
+        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
+      </div>
+      <h1 style="color:#F0B90B;font-size:22px;margin:0 0 20px 0">📋 New KYC Submission</h1>
+      <table style="width:100%;color:#EAECEF;font-size:14px;border-collapse:collapse">
+        <tr><td style="padding:8px 0;color:#848E9C;width:140px">User</td><td>${user.name}</td></tr>
+        <tr><td style="padding:8px 0;color:#848E9C">Email</td><td>${user.email}</td></tr>
+        <tr><td style="padding:8px 0;color:#848E9C">User ID</td><td>#${user.id}</td></tr>
+        <tr><td style="padding:8px 0;color:#848E9C">Submitted</td><td>${new Date().toUTCString()}</td></tr>
+      </table>
+      <hr style="border:none;border-top:1px solid #2B3139;margin:20px 0">
+      <table style="width:100%;color:#EAECEF;font-size:14px;border-collapse:collapse">
+        <tr><td style="padding:8px 0;color:#848E9C;width:140px">Legal Name</td><td>${kycData.name}</td></tr>
+        <tr><td style="padding:8px 0;color:#848E9C">ID Type</td><td>${kycData.idType}</td></tr>
+        <tr><td style="padding:8px 0;color:#848E9C">ID Number</td><td>${kycData.idNumber}</td></tr>
+      </table>
+      <hr style="border:none;border-top:1px solid #2B3139;margin:20px 0">
+      <p style="color:#848E9C;font-size:13px">See attached ID photos to verify.</p>
+      <p style="color:#848E9C;font-size:12px;margin-top:24px">To approve in DB:<br><code style="color:#0ECB81">UPDATE users SET kyc_status='verified' WHERE id=${user.id};</code></p>
+      <p style="color:#848E9C;font-size:12px">To reject:<br><code style="color:#F6465D">UPDATE users SET kyc_status='rejected' WHERE id=${user.id};</code></p>
+    </div>
+  `;
+}
+
+async function sendKycEmail(user, kycData, files){
+  if(!brevo){
+    console.log('[KYC EMAIL SKIPPED]', user.email);
+    return;
+  }
+  const attachments = files.map(f => ({
+    name: f.originalname,
+    content: f.buffer.toString('base64')
+  }));
+
+  await brevo.transactionalEmails.sendTransacEmail({
+    subject: `📋 KYC Submission — ${user.name}`,
+    htmlContent: kycEmailHTML(user, kycData),
+    sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
+    to: [{ email: 'biertex.org@gmail.com', name: 'Biertex Admin' }],
+    attachment: attachments
   });
 }
 
@@ -423,6 +479,48 @@ app.post('/api/reset-password', async (req, res) => {
     console.error('Reset password error:', e);
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+/* -------- SUBMIT KYC -------- */
+app.post('/api/kyc/submit', requireAuth, kycUpload.fields([
+  { name: 'idFront', maxCount: 1 },
+  { name: 'idBack', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    const { name, idType, idNumber } = req.body;
+    if(!name || name.length < 2) return res.status(400).json({ error: 'Full legal name required' });
+    if(!idType) return res.status(400).json({ error: 'ID type required' });
+    if(!idNumber || idNumber.length < 4) return res.status(400).json({ error: 'Valid ID number required' });
+    if(!req.files || !req.files.idFront || !req.files.idBack){
+      return res.status(400).json({ error: 'Both ID photos required' });
+    }
+
+    const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(req.user.id);
+    if(!user) return res.status(404).json({ error: 'User not found' });
+
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE users SET kyc_status='pending', kyc_name=?, kyc_id_type=?, kyc_id_number=?, kyc_submitted_at=? WHERE id=?`)
+      .run(name, idType, idNumber, now, user.id);
+
+    const files = [req.files.idFront[0], req.files.idBack[0]];
+    sendKycEmail(user, { name, idType, idNumber }, files)
+      .catch(e => console.error('KYC email failed:', e.message));
+
+    res.json({ success: true, status: 'pending' });
+  } catch(e){
+    console.error('KYC submit error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/* -------- GET KYC STATUS -------- */
+app.get('/api/kyc/status', requireAuth, (req, res) => {
+  const row = db.prepare('SELECT kyc_status, kyc_submitted_at FROM users WHERE id = ?').get(req.user.id);
+  if(!row) return res.status(404).json({ error: 'User not found' });
+  res.json({
+    status: row.kyc_status || 'none',
+    submittedAt: row.kyc_submitted_at || null
+  });
 });
 
 /* ============================================================
