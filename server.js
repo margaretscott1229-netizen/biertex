@@ -113,7 +113,7 @@ async function sendEmail({ to, toName, subject, html }) {
   await brevo.transactionalEmails.sendTransacEmail({
     subject,
     htmlContent: html,
-    sender: { name: 'Biertex', email: 'noreply@biertex.dev' },
+    sender: { name: 'Biertex', email: 'margaretscott1229@gmail.com' },
     to: [{ email: to, name: toName }]
   });
 }
