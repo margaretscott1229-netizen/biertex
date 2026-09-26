@@ -1,8 +1,6 @@
 /* ============================================================
-   BIERTEX BACKEND — Authentication Server
-   ============================================================
-   Handles: signup, login, session verification
-   Stack: Node + Express + SQLite + bcrypt + JWT
+   BIERTEX BACKEND — Full Server
+   Auth + Email Verification + Password Reset
    ============================================================ */
 
 const express = require('express');
@@ -10,25 +8,26 @@ const cors = require('cors');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { BrevoClient } = require('@getbrevo/brevo');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = 'CHANGE_THIS_TO_A_LONG_RANDOM_STRING_LATER';
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
 /* ============================================================
    MIDDLEWARE
    ============================================================ */
-app.use(cors()); // allow frontend calls
-app.use(express.json()); // parse JSON bodies
-
+app.use(cors());
+app.use(express.json());
 
 /* ============================================================
-   DATABASE SETUP
+   DATABASE
    ============================================================ */
 const db = new Database('biertex.db');
 db.pragma('journal_mode = WAL');
 
-// Create users table if it doesn't exist
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,14 +38,45 @@ db.exec(`
   );
 `);
 
+// Add email_verified column if it doesn't exist
+const hasEmailVerified = db.prepare(
+  "SELECT COUNT(*) as c FROM pragma_table_info('users') WHERE name='email_verified'"
+).get().c > 0;
+if (!hasEmailVerified) {
+  db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0');
+}
+
+// Verification codes table (handles email verify + password reset)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS verification_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    code_hash TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    attempts INTEGER DEFAULT 0,
+    expires_at TEXT NOT NULL,
+    used_at TEXT DEFAULT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+`);
+
 console.log('✅ Database ready (biertex.db)');
 
+/* ============================================================
+   BREVO CLIENT
+   ============================================================ */
+let brevo = null;
+if (BREVO_API_KEY) {
+  brevo = new BrevoClient({ apiKey: BREVO_API_KEY });
+  console.log('✅ Brevo client initialized');
+} else {
+  console.warn('⚠️ BREVO_API_KEY not set — emails will be skipped');
+}
 
 /* ============================================================
    HELPERS
    ============================================================ */
-
-// Generate JWT token (valid 7 days)
 function makeToken(user) {
   return jwt.sign(
     { id: user.id, email: user.email },
@@ -55,13 +85,10 @@ function makeToken(user) {
   );
 }
 
-// Verify JWT — middleware for protected routes
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
+  if (!token) return res.status(401).json({ error: 'No token provided' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
@@ -70,27 +97,77 @@ function requireAuth(req, res, next) {
   }
 }
 
+function generateCode() {
+  return String(crypto.randomInt(100000, 999999));
+}
 
+function hashCode(code, userId) {
+  return crypto.createHash('sha256').update(code + ':' + userId + ':' + JWT_SECRET).digest('hex');
+}
+
+async function sendEmail({ to, toName, subject, html }) {
+  if (!brevo) {
+    console.log('[EMAIL SKIPPED]', subject, '→', to);
+    return;
+  }
+  await brevo.transactionalEmails.sendTransacEmail({
+    subject,
+    htmlContent: html,
+    sender: { name: 'Biertex', email: 'noreply@biertex.dev' },
+    to: [{ email: to, name: toName }]
+  });
+}
+
+function verificationEmailHTML(name, code) {
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
+      <div style="text-align:center;margin-bottom:24px">
+        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
+      </div>
+      <h1 style="text-align:center;color:#F0B90B;font-size:22px;margin:0 0 8px 0">Your verification code</h1>
+      <p style="color:#848E9C;text-align:center;margin-bottom:28px">Hi ${name}, thanks for signing up.</p>
+      <div style="background:#12161C;border:1px solid #2B3139;border-radius:12px;padding:32px;text-align:center;margin-bottom:24px">
+        <div style="font-size:38px;font-weight:800;letter-spacing:8px;color:#EAECEF">${code}</div>
+      </div>
+      <p style="color:#848E9C;text-align:center;font-size:14px">Enter this code on the Verify Email page to activate your account.</p>
+      <p style="color:#848E9C;text-align:center;font-size:12px;margin-top:24px">This code expires in 15 minutes. If you didn't sign up, ignore this email.</p>
+    </div>
+  `;
+}
+
+function resetEmailHTML(name, code) {
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
+      <div style="text-align:center;margin-bottom:24px">
+        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
+      </div>
+      <h1 style="text-align:center;color:#F0B90B;font-size:22px;margin:0 0 8px 0">Password reset code</h1>
+      <p style="color:#848E9C;text-align:center;margin-bottom:28px">Hi ${name}, you requested a password reset.</p>
+      <div style="background:#12161C;border:1px solid #2B3139;border-radius:12px;padding:32px;text-align:center;margin-bottom:24px">
+        <div style="font-size:38px;font-weight:800;letter-spacing:8px;color:#EAECEF">${code}</div>
+      </div>
+      <p style="color:#848E9C;text-align:center;font-size:14px">Enter this code along with your new password on the reset page.</p>
+      <p style="color:#848E9C;text-align:center;font-size:12px;margin-top:24px">Expires in 15 minutes. If you didn't request this, ignore this email.</p>
+    </div>
+  `;
+}
 /* ============================================================
    ROUTES
    ============================================================ */
 
-// Home
 app.get('/', (req, res) => {
   res.send('Biertex backend is running! 🚀');
 });
 
-// Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Biertex API is live', time: new Date() });
 });
 
-/* -------- SIGN UP -------- */
+/* -------- REGISTER -------- */
 app.post('/api/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    // Validate
     if (!name || name.length < 2) {
       return res.status(400).json({ error: 'Name must be at least 2 characters' });
     }
@@ -101,72 +178,252 @@ app.post('/api/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
-    // Check if email already exists
     const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
     if (existing) {
       return res.status(409).json({ error: 'Email already registered' });
     }
 
-    // Hash password
     const hash = await bcrypt.hash(password, 10);
-
-    // Insert user
     const result = db.prepare(
       'INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)'
     ).run(name, email.toLowerCase(), hash);
 
-    // Return user + token
     const user = { id: result.lastInsertRowid, name, email: email.toLowerCase() };
-    const token = makeToken(user);
 
-    res.status(201).json({ user, token });
+    // Generate verification code
+    const code = generateCode();
+    const codeHash = hashCode(code, user.id);
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    // Delete any old codes for this user/purpose
+    db.prepare("DELETE FROM verification_codes WHERE user_id = ? AND purpose = 'email_verify'").run(user.id);
+
+    db.prepare(
+      "INSERT INTO verification_codes (user_id, code_hash, purpose, expires_at) VALUES (?, ?, 'email_verify', ?)"
+    ).run(user.id, codeHash, expiresAt);
+
+    // Send email (don't block if it fails)
+    sendEmail({
+      to: user.email,
+      toName: user.name,
+      subject: 'Your Biertex verification code',
+      html: verificationEmailHTML(user.name, code)
+    }).catch(e => console.error('Verification email failed:', e.message));
+
+    const token = makeToken(user);
+    res.status(201).json({
+      user,
+      token,
+      needsVerification: true,
+      message: 'Account created. Check your email for a verification code.'
+    });
   } catch (e) {
     console.error('Register error:', e);
     res.status(500).json({ error: 'Server error during registration' });
   }
 });
 
-/* -------- LOG IN -------- */
+/* -------- LOGIN -------- */
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
     }
 
-    // Find user
     const row = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
-    if (!row) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
+    if (!row) return res.status(401).json({ error: 'Invalid email or password' });
 
-    // Compare password
     const ok = await bcrypt.compare(password, row.password_hash);
-    if (!ok) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
+    if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
 
-    // Success
     const user = { id: row.id, name: row.name, email: row.email };
     const token = makeToken(user);
 
-    res.json({ user, token });
+    res.json({
+      user,
+      token,
+      emailVerified: row.email_verified === 1
+    });
   } catch (e) {
     console.error('Login error:', e);
     res.status(500).json({ error: 'Server error during login' });
   }
 });
 
-/* -------- GET CURRENT USER (protected) -------- */
+/* -------- GET CURRENT USER -------- */
 app.get('/api/me', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT id, name, email, created_at FROM users WHERE id = ?').get(req.user.id);
-  if (!row) {
-    return res.status(404).json({ error: 'User not found' });
-  }
+  const row = db.prepare('SELECT id, name, email, email_verified, created_at FROM users WHERE id = ?').get(req.user.id);
+  if (!row) return res.status(404).json({ error: 'User not found' });
   res.json({ user: row });
 });
 
+/* -------- VERIFY EMAIL WITH CODE -------- */
+app.post('/api/verify-email-code', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) {
+      return res.status(400).json({ error: 'Email and code required' });
+    }
+
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
+    if (!user) return res.status(400).json({ error: 'Invalid code' });
+
+    if (user.email_verified === 1) {
+      return res.json({ success: true, message: 'Email already verified' });
+    }
+
+    const row = db.prepare(
+      "SELECT * FROM verification_codes WHERE user_id = ? AND purpose = 'email_verify' AND used_at IS NULL ORDER BY id DESC LIMIT 1"
+    ).get(user.id);
+
+    if (!row) return res.status(400).json({ error: 'No active code. Request a new one.' });
+    if (new Date(row.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    }
+    if (row.attempts >= 5) {
+      return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
+    }
+
+    const incomingHash = hashCode(code, user.id);
+    if (incomingHash !== row.code_hash) {
+      db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?').run(row.id);
+      return res.status(400).json({ error: 'Invalid code' });
+    }
+
+    db.prepare('UPDATE users SET email_verified = 1 WHERE id = ?').run(user.id);
+    db.prepare("UPDATE verification_codes SET used_at = datetime('now') WHERE id = ?").run(row.id);
+
+    res.json({ success: true, message: 'Email verified' });
+  } catch (e) {
+    console.error('Verify error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/* -------- RESEND VERIFICATION CODE -------- */
+app.post('/api/resend-code', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
+    if (!user) return res.json({ success: true, message: 'If that email exists, we sent a code.' });
+
+    if (user.email_verified === 1) {
+      return res.json({ success: true, message: 'Email already verified' });
+    }
+
+    // Rate limit: max 1 code per 45 seconds
+    const last = db.prepare(
+      "SELECT created_at FROM verification_codes WHERE user_id = ? AND purpose = 'email_verify' ORDER BY id DESC LIMIT 1"
+    ).get(user.id);
+    if (last) {
+      const secs = (Date.now() - new Date(last.created_at + 'Z').getTime()) / 1000;
+      if (secs < 45) {
+        return res.status(429).json({ error: 'Please wait before requesting another code' });
+      }
+    }
+
+    const code = generateCode();
+    const codeHash = hashCode(code, user.id);
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    db.prepare("DELETE FROM verification_codes WHERE user_id = ? AND purpose = 'email_verify'").run(user.id);
+    db.prepare(
+      "INSERT INTO verification_codes (user_id, code_hash, purpose, expires_at) VALUES (?, ?, 'email_verify', ?)"
+    ).run(user.id, codeHash, expiresAt);
+
+    sendEmail({
+      to: user.email,
+      toName: user.name,
+      subject: 'Your Biertex verification code',
+      html: verificationEmailHTML(user.name, code)
+    }).catch(e => console.error('Resend email failed:', e.message));
+
+    res.json({ success: true, message: 'Code sent' });
+  } catch (e) {
+    console.error('Resend error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/* -------- FORGOT PASSWORD (send reset code) -------- */
+app.post('/api/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const user = db.prepare('SELECT id, name, email FROM users WHERE email = ?').get(email.toLowerCase());
+
+    // Always return success (prevent email enumeration)
+    if (user) {
+      const code = generateCode();
+      const codeHash = hashCode(code, user.id);
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+      db.prepare("DELETE FROM verification_codes WHERE user_id = ? AND purpose = 'password_reset'").run(user.id);
+      db.prepare(
+        "INSERT INTO verification_codes (user_id, code_hash, purpose, expires_at) VALUES (?, ?, 'password_reset', ?)"
+      ).run(user.id, codeHash, expiresAt);
+
+      sendEmail({
+        to: user.email,
+        toName: user.name,
+        subject: 'Your Biertex password reset code',
+        html: resetEmailHTML(user.name, code)
+      }).catch(e => console.error('Reset email failed:', e.message));
+    }
+
+    res.json({ success: true, message: 'If that email exists, we sent a reset code.' });
+  } catch (e) {
+    console.error('Forgot password error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/* -------- RESET PASSWORD (with code) -------- */
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: 'Email, code, and new password required' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
+    if (!user) return res.status(400).json({ error: 'Invalid code' });
+
+    const row = db.prepare(
+      "SELECT * FROM verification_codes WHERE user_id = ? AND purpose = 'password_reset' AND used_at IS NULL ORDER BY id DESC LIMIT 1"
+    ).get(user.id);
+
+    if (!row) return res.status(400).json({ error: 'No active reset code' });
+    if (new Date(row.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    }
+    if (row.attempts >= 5) {
+      return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
+    }
+
+    const incomingHash = hashCode(code, user.id);
+    if (incomingHash !== row.code_hash) {
+      db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?').run(row.id);
+      return res.status(400).json({ error: 'Invalid code' });
+    }
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, user.id);
+    db.prepare("UPDATE verification_codes SET used_at = datetime('now') WHERE id = ?").run(row.id);
+
+    res.json({ success: true, message: 'Password updated. You can now log in.' });
+  } catch (e) {
+    console.error('Reset password error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 /* ============================================================
    START SERVER
@@ -175,5 +432,9 @@ app.listen(PORT, () => {
   console.log('✅ Biertex backend running at http://localhost:' + PORT);
   console.log(' - POST /api/register');
   console.log(' - POST /api/login');
-  console.log(' - GET /api/me (requires token)');
+  console.log(' - GET /api/me');
+  console.log(' - POST /api/verify-email-code');
+  console.log(' - POST /api/resend-code');
+  console.log(' - POST /api/forgot-password');
+  console.log(' - POST /api/reset-password');
 });
