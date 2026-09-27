@@ -260,7 +260,13 @@ app.get('/', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Biertex API is live', time: new Date() });
+  res.json({
+    status: 'ok',
+    message: 'Biertex API is live',
+    time: new Date(),
+    adminKeySet: !!process.env.ADMIN_KEY,
+    adminKeyLength: process.env.ADMIN_KEY ? process.env.ADMIN_KEY.length : 0
+  });
 });
 
 /* -------- REGISTER -------- */
