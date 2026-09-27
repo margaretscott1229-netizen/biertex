@@ -30,6 +30,11 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+/* ============================================================
+   WALLET MODULE
+   ============================================================ */
+const createWallet = require('./wallet');
+const wallet = createWallet(pool);
 
 /* ============================================================
    FILE UPLOAD
@@ -316,6 +321,7 @@ app.post('/api/register', async (req, res) => {
       [name, email.toLowerCase(), hash]
     );
     const user = { id: result.rows[0].id, name, email: email.toLowerCase() };
+    await wallet.ensureBalances(user.id);
 
     const code = generateCode();
     const codeHash = hashCode(code, user.id);
@@ -664,6 +670,73 @@ app.get('/api/admin/kyc/:id/reject', async (req, res) => {
 (async () => {
   try {
     await initDb();
+    /* ============================================================
+   WALLET ROUTES
+   ============================================================ */
+
+app.get('/api/wallet', requireAuth, async (req, res) => {
+  try {
+    const balances = await wallet.getAllBalances(req.user.id);
+    res.json({ balances });
+  } catch (err) {
+    console.error('GET /api/wallet', err);
+    res.status(500).json({ error: 'Failed to load wallet' });
+  }
+});
+
+app.get('/api/wallet/transactions', requireAuth, async (req, res) => {
+  try {
+    const asset = req.query.asset || null;
+    const limit = parseInt(req.query.limit, 10) || 50;
+    const transactions = await wallet.getTransactions(req.user.id, { asset, limit });
+    res.json({ transactions });
+  } catch (err) {
+    console.error('GET /api/wallet/transactions', err);
+    res.status(500).json({ error: 'Failed to load transactions' });
+  }
+});
+
+/* ============================================================
+   ADMIN — WALLET BACKFILL + MANUAL CREDIT
+   ============================================================ */
+
+app.get('/api/admin/wallet/backfill', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  try {
+    const { rows } = await pool.query('SELECT id FROM users');
+    for (const r of rows) await wallet.ensureBalances(r.id);
+    res.json({ ok: true, usersProcessed: rows.length });
+  } catch (err) {
+    console.error('admin backfill', err);
+    res.status(500).json({ error: 'backfill failed' });
+  }
+});
+
+app.post('/api/admin/wallet/credit', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const { userId, asset, amount, reason } = req.body || {};
+  if (!userId || !asset || amount == null) {
+    return res.status(400).json({ error: 'userId, asset, amount required' });
+  }
+  try {
+    const out = await wallet.applyEntry({
+      userId: Number(userId),
+      asset,
+      amount: Number(amount),
+      type: 'adjustment',
+      refId: `admin-${Date.now()}-${userId}`,
+      metadata: { reason: reason || 'admin credit' },
+    });
+    res.json(out);
+  } catch (err) {
+    console.error('admin credit', err);
+    res.status(400).json({ error: err.message });
+  }
+});
     app.listen(PORT, () => {
       console.log('✅ Biertex backend running at http://localhost:' + PORT);
       console.log(' - POST /api/register');
