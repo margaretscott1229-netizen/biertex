@@ -1,25 +1,21 @@
 /* ============================================================
-   BIERTEX BACKEND — Full Server
-   Auth + Email Verification + Password Reset
+   BIERTEX BACKEND — PostgreSQL Edition
    ============================================================ */
 
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { BrevoClient } = require('@getbrevo/brevo');
 const multer = require('multer');
-const kycUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }
-});
+const { BrevoClient } = require('@getbrevo/brevo');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 /* ============================================================
    MIDDLEWARE
@@ -28,51 +24,20 @@ app.use(cors());
 app.use(express.json());
 
 /* ============================================================
-   DATABASE
+   DATABASE (PostgreSQL)
    ============================================================ */
-const db = new Database('biertex.db');
-db.pragma('journal_mode = WAL');
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-`);
-
-// Add email_verified column if it doesn't exist
-const hasEmailVerified = db.prepare(
-  "SELECT COUNT(*) as c FROM pragma_table_info('users') WHERE name='email_verified'"
-).get().c > 0;
-if (!hasEmailVerified) {
-  db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0');
-}
-
-// Verification codes table (handles email verify + password reset)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS verification_codes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    code_hash TEXT NOT NULL,
-    purpose TEXT NOT NULL,
-    attempts INTEGER DEFAULT 0,
-    expires_at TEXT NOT NULL,
-    used_at TEXT DEFAULT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-`);
-
-// Add KYC columns to users (idempotent)
-const kycCols = ['kyc_status','kyc_name','kyc_id_type','kyc_id_number','kyc_submitted_at'];
-kycCols.forEach(col => {
-  const exists = db.prepare("SELECT COUNT(*) as c FROM pragma_table_info('users') WHERE name=?").get(col).c > 0;
-  if(!exists) db.exec(`ALTER TABLE users ADD COLUMN ${col} TEXT`);
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
-console.log('✅ Database ready (biertex.db)');
+
+/* ============================================================
+   FILE UPLOAD
+   ============================================================ */
+const kycUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }
+});
 
 /* ============================================================
    BREVO CLIENT
@@ -128,6 +93,41 @@ async function sendEmail({ to, toName, subject, html }) {
     to: [{ email: to, name: toName }]
   });
 }
+
+function verificationEmailHTML(name, code) {
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
+      <div style="text-align:center;margin-bottom:24px">
+        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
+      </div>
+      <h1 style="text-align:center;color:#F0B90B;font-size:22px;margin:0 0 8px 0">Your verification code</h1>
+      <p style="color:#848E9C;text-align:center;margin-bottom:28px">Hi ${name}, thanks for signing up.</p>
+      <div style="background:#12161C;border:1px solid #2B3139;border-radius:12px;padding:32px;text-align:center;margin-bottom:24px">
+        <div style="font-size:38px;font-weight:800;letter-spacing:8px;color:#EAECEF">${code}</div>
+      </div>
+      <p style="color:#848E9C;text-align:center;font-size:14px">Enter this code on the Verify Email page to activate your account.</p>
+      <p style="color:#848E9C;text-align:center;font-size:12px;margin-top:24px">This code expires in 15 minutes. If you didn't sign up, ignore this email.</p>
+    </div>
+  `;
+}
+
+function resetEmailHTML(name, code) {
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
+      <div style="text-align:center;margin-bottom:24px">
+        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
+      </div>
+      <h1 style="text-align:center;color:#F0B90B;font-size:22px;margin:0 0 8px 0">Password reset code</h1>
+      <p style="color:#848E9C;text-align:center;margin-bottom:28px">Hi ${name}, you requested a password reset.</p>
+      <div style="background:#12161C;border:1px solid #2B3139;border-radius:12px;padding:32px;text-align:center;margin-bottom:24px">
+        <div style="font-size:38px;font-weight:800;letter-spacing:8px;color:#EAECEF">${code}</div>
+      </div>
+      <p style="color:#848E9C;text-align:center;font-size:14px">Enter this code along with your new password on the reset page.</p>
+      <p style="color:#848E9C;text-align:center;font-size:12px;margin-top:24px">Expires in 15 minutes. If you didn't request this, ignore this email.</p>
+    </div>
+  `;
+}
+
 function kycEmailHTML(user, kycData) {
   return `
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
@@ -173,44 +173,45 @@ async function sendKycEmail(user, kycData, files){
     attachment: attachments
   });
 }
+/* ============================================================
+   DATABASE INIT
+   ============================================================ */
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      email_verified INTEGER DEFAULT 0,
+      kyc_status TEXT,
+      kyc_name TEXT,
+      kyc_id_type TEXT,
+      kyc_id_number TEXT,
+      kyc_submitted_at TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
-function verificationEmailHTML(name, code) {
-  return `
-    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
-      <div style="text-align:center;margin-bottom:24px">
-        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
-      </div>
-      <h1 style="text-align:center;color:#F0B90B;font-size:22px;margin:0 0 8px 0">Your verification code</h1>
-      <p style="color:#848E9C;text-align:center;margin-bottom:28px">Hi ${name}, thanks for signing up.</p>
-      <div style="background:#12161C;border:1px solid #2B3139;border-radius:12px;padding:32px;text-align:center;margin-bottom:24px">
-        <div style="font-size:38px;font-weight:800;letter-spacing:8px;color:#EAECEF">${code}</div>
-      </div>
-      <p style="color:#848E9C;text-align:center;font-size:14px">Enter this code on the Verify Email page to activate your account.</p>
-      <p style="color:#848E9C;text-align:center;font-size:12px;margin-top:24px">This code expires in 15 minutes. If you didn't sign up, ignore this email.</p>
-    </div>
-  `;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS verification_codes (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      code_hash TEXT NOT NULL,
+      purpose TEXT NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ DEFAULT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  console.log('✅ Database ready (PostgreSQL)');
 }
 
-function resetEmailHTML(name, code) {
-  return `
-    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
-      <div style="text-align:center;margin-bottom:24px">
-        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
-      </div>
-      <h1 style="text-align:center;color:#F0B90B;font-size:22px;margin:0 0 8px 0">Password reset code</h1>
-      <p style="color:#848E9C;text-align:center;margin-bottom:28px">Hi ${name}, you requested a password reset.</p>
-      <div style="background:#12161C;border:1px solid #2B3139;border-radius:12px;padding:32px;text-align:center;margin-bottom:24px">
-        <div style="font-size:38px;font-weight:800;letter-spacing:8px;color:#EAECEF">${code}</div>
-      </div>
-      <p style="color:#848E9C;text-align:center;font-size:14px">Enter this code along with your new password on the reset page.</p>
-      <p style="color:#848E9C;text-align:center;font-size:12px;margin-top:24px">Expires in 15 minutes. If you didn't request this, ignore this email.</p>
-    </div>
-  `;
-}
 /* ============================================================
    ROUTES
    ============================================================ */
-
 app.get('/', (req, res) => {
   res.send('Biertex backend is running! 🚀');
 });
@@ -223,42 +224,30 @@ app.get('/api/health', (req, res) => {
 app.post('/api/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
+    if (!name || name.length < 2) return res.status(400).json({ error: 'Name must be at least 2 characters' });
+    if (!email || !email.includes('@')) return res.status(400).json({ error: 'Valid email required' });
+    if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
-    if (!name || name.length < 2) {
-      return res.status(400).json({ error: 'Name must be at least 2 characters' });
-    }
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ error: 'Valid email required' });
-    }
-    if (!password || password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    }
-
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
-    if (existing) {
-      return res.status(409).json({ error: 'Email already registered' });
-    }
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+    if (existing.rows.length > 0) return res.status(409).json({ error: 'Email already registered' });
 
     const hash = await bcrypt.hash(password, 10);
-    const result = db.prepare(
-      'INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)'
-    ).run(name, email.toLowerCase(), hash);
+    const result = await pool.query(
+      'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id',
+      [name, email.toLowerCase(), hash]
+    );
+    const user = { id: result.rows[0].id, name, email: email.toLowerCase() };
 
-    const user = { id: result.lastInsertRowid, name, email: email.toLowerCase() };
-
-    // Generate verification code
     const code = generateCode();
     const codeHash = hashCode(code, user.id);
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-    // Delete any old codes for this user/purpose
-    db.prepare("DELETE FROM verification_codes WHERE user_id = ? AND purpose = 'email_verify'").run(user.id);
+    await pool.query("DELETE FROM verification_codes WHERE user_id = $1 AND purpose = 'email_verify'", [user.id]);
+    await pool.query(
+      "INSERT INTO verification_codes (user_id, code_hash, purpose, expires_at) VALUES ($1, $2, 'email_verify', $3)",
+      [user.id, codeHash, expiresAt]
+    );
 
-    db.prepare(
-      "INSERT INTO verification_codes (user_id, code_hash, purpose, expires_at) VALUES (?, ?, 'email_verify', ?)"
-    ).run(user.id, codeHash, expiresAt);
-
-    // Send email (don't block if it fails)
     sendEmail({
       to: user.email,
       toName: user.name,
@@ -267,12 +256,7 @@ app.post('/api/register', async (req, res) => {
     }).catch(e => console.error('Verification email failed:', e.message));
 
     const token = makeToken(user);
-    res.status(201).json({
-      user,
-      token,
-      needsVerification: true,
-      message: 'Account created. Check your email for a verification code.'
-    });
+    res.status(201).json({ user, token, needsVerification: true, message: 'Account created. Check your email for a verification code.' });
   } catch (e) {
     console.error('Register error:', e);
     res.status(500).json({ error: 'Server error during registration' });
@@ -283,11 +267,10 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
-    }
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-    const row = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    const row = result.rows[0];
     if (!row) return res.status(401).json({ error: 'Invalid email or password' });
 
     const ok = await bcrypt.compare(password, row.password_hash);
@@ -296,11 +279,7 @@ app.post('/api/login', async (req, res) => {
     const user = { id: row.id, name: row.name, email: row.email };
     const token = makeToken(user);
 
-    res.json({
-      user,
-      token,
-      emailVerified: row.email_verified === 1
-    });
+    res.json({ user, token, emailVerified: row.email_verified === 1 });
   } catch (e) {
     console.error('Login error:', e);
     res.status(500).json({ error: 'Server error during login' });
@@ -308,47 +287,40 @@ app.post('/api/login', async (req, res) => {
 });
 
 /* -------- GET CURRENT USER -------- */
-app.get('/api/me', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT id, name, email, email_verified, created_at FROM users WHERE id = ?').get(req.user.id);
-  if (!row) return res.status(404).json({ error: 'User not found' });
-  res.json({ user: row });
+app.get('/api/me', requireAuth, async (req, res) => {
+  const result = await pool.query('SELECT id, name, email, email_verified, created_at FROM users WHERE id = $1', [req.user.id]);
+  if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+  res.json({ user: result.rows[0] });
 });
 
 /* -------- VERIFY EMAIL WITH CODE -------- */
 app.post('/api/verify-email-code', async (req, res) => {
   try {
     const { email, code } = req.body;
-    if (!email || !code) {
-      return res.status(400).json({ error: 'Email and code required' });
-    }
+    if (!email || !code) return res.status(400).json({ error: 'Email and code required' });
 
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
+    const uRes = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    const user = uRes.rows[0];
     if (!user) return res.status(400).json({ error: 'Invalid code' });
+    if (user.email_verified === 1) return res.json({ success: true, message: 'Email already verified' });
 
-    if (user.email_verified === 1) {
-      return res.json({ success: true, message: 'Email already verified' });
-    }
-
-    const row = db.prepare(
-      "SELECT * FROM verification_codes WHERE user_id = ? AND purpose = 'email_verify' AND used_at IS NULL ORDER BY id DESC LIMIT 1"
-    ).get(user.id);
-
+    const cRes = await pool.query(
+      "SELECT * FROM verification_codes WHERE user_id = $1 AND purpose = 'email_verify' AND used_at IS NULL ORDER BY id DESC LIMIT 1",
+      [user.id]
+    );
+    const row = cRes.rows[0];
     if (!row) return res.status(400).json({ error: 'No active code. Request a new one.' });
-    if (new Date(row.expires_at) < new Date()) {
-      return res.status(400).json({ error: 'Code expired. Request a new one.' });
-    }
-    if (row.attempts >= 5) {
-      return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
-    }
+    if (new Date(row.expires_at) < new Date()) return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    if (row.attempts >= 5) return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
 
     const incomingHash = hashCode(code, user.id);
     if (incomingHash !== row.code_hash) {
-      db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?').run(row.id);
+      await pool.query('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = $1', [row.id]);
       return res.status(400).json({ error: 'Invalid code' });
     }
 
-    db.prepare('UPDATE users SET email_verified = 1 WHERE id = ?').run(user.id);
-    db.prepare("UPDATE verification_codes SET used_at = datetime('now') WHERE id = ?").run(row.id);
+    await pool.query('UPDATE users SET email_verified = 1 WHERE id = $1', [user.id]);
+    await pool.query('UPDATE verification_codes SET used_at = NOW() WHERE id = $1', [row.id]);
 
     res.json({ success: true, message: 'Email verified' });
   } catch (e) {
@@ -363,32 +335,30 @@ app.post('/api/resend-code', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
 
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
+    const uRes = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    const user = uRes.rows[0];
     if (!user) return res.json({ success: true, message: 'If that email exists, we sent a code.' });
+    if (user.email_verified === 1) return res.json({ success: true, message: 'Email already verified' });
 
-    if (user.email_verified === 1) {
-      return res.json({ success: true, message: 'Email already verified' });
-    }
-
-    // Rate limit: max 1 code per 45 seconds
-    const last = db.prepare(
-      "SELECT created_at FROM verification_codes WHERE user_id = ? AND purpose = 'email_verify' ORDER BY id DESC LIMIT 1"
-    ).get(user.id);
+    const lRes = await pool.query(
+      "SELECT created_at FROM verification_codes WHERE user_id = $1 AND purpose = 'email_verify' ORDER BY id DESC LIMIT 1",
+      [user.id]
+    );
+    const last = lRes.rows[0];
     if (last) {
-      const secs = (Date.now() - new Date(last.created_at + 'Z').getTime()) / 1000;
-      if (secs < 45) {
-        return res.status(429).json({ error: 'Please wait before requesting another code' });
-      }
+      const secs = (Date.now() - new Date(last.created_at).getTime()) / 1000;
+      if (secs < 45) return res.status(429).json({ error: 'Please wait before requesting another code' });
     }
 
     const code = generateCode();
     const codeHash = hashCode(code, user.id);
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-    db.prepare("DELETE FROM verification_codes WHERE user_id = ? AND purpose = 'email_verify'").run(user.id);
-    db.prepare(
-      "INSERT INTO verification_codes (user_id, code_hash, purpose, expires_at) VALUES (?, ?, 'email_verify', ?)"
-    ).run(user.id, codeHash, expiresAt);
+    await pool.query("DELETE FROM verification_codes WHERE user_id = $1 AND purpose = 'email_verify'", [user.id]);
+    await pool.query(
+      "INSERT INTO verification_codes (user_id, code_hash, purpose, expires_at) VALUES ($1, $2, 'email_verify', $3)",
+      [user.id, codeHash, expiresAt]
+    );
 
     sendEmail({
       to: user.email,
@@ -404,24 +374,25 @@ app.post('/api/resend-code', async (req, res) => {
   }
 });
 
-/* -------- FORGOT PASSWORD (send reset code) -------- */
+/* -------- FORGOT PASSWORD -------- */
 app.post('/api/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
 
-    const user = db.prepare('SELECT id, name, email FROM users WHERE email = ?').get(email.toLowerCase());
+    const uRes = await pool.query('SELECT id, name, email FROM users WHERE email = $1', [email.toLowerCase()]);
+    const user = uRes.rows[0];
 
-    // Always return success (prevent email enumeration)
     if (user) {
       const code = generateCode();
       const codeHash = hashCode(code, user.id);
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-      db.prepare("DELETE FROM verification_codes WHERE user_id = ? AND purpose = 'password_reset'").run(user.id);
-      db.prepare(
-        "INSERT INTO verification_codes (user_id, code_hash, purpose, expires_at) VALUES (?, ?, 'password_reset', ?)"
-      ).run(user.id, codeHash, expiresAt);
+      await pool.query("DELETE FROM verification_codes WHERE user_id = $1 AND purpose = 'password_reset'", [user.id]);
+      await pool.query(
+        "INSERT INTO verification_codes (user_id, code_hash, purpose, expires_at) VALUES ($1, $2, 'password_reset', $3)",
+        [user.id, codeHash, expiresAt]
+      );
 
       sendEmail({
         to: user.email,
@@ -438,41 +409,35 @@ app.post('/api/forgot-password', async (req, res) => {
   }
 });
 
-/* -------- RESET PASSWORD (with code) -------- */
+/* -------- RESET PASSWORD -------- */
 app.post('/api/reset-password', async (req, res) => {
   try {
     const { email, code, newPassword } = req.body;
-    if (!email || !code || !newPassword) {
-      return res.status(400).json({ error: 'Email, code, and new password required' });
-    }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    }
+    if (!email || !code || !newPassword) return res.status(400).json({ error: 'Email, code, and new password required' });
+    if (newPassword.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
+    const uRes = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    const user = uRes.rows[0];
     if (!user) return res.status(400).json({ error: 'Invalid code' });
 
-    const row = db.prepare(
-      "SELECT * FROM verification_codes WHERE user_id = ? AND purpose = 'password_reset' AND used_at IS NULL ORDER BY id DESC LIMIT 1"
-    ).get(user.id);
-
+    const cRes = await pool.query(
+      "SELECT * FROM verification_codes WHERE user_id = $1 AND purpose = 'password_reset' AND used_at IS NULL ORDER BY id DESC LIMIT 1",
+      [user.id]
+    );
+    const row = cRes.rows[0];
     if (!row) return res.status(400).json({ error: 'No active reset code' });
-    if (new Date(row.expires_at) < new Date()) {
-      return res.status(400).json({ error: 'Code expired. Request a new one.' });
-    }
-    if (row.attempts >= 5) {
-      return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
-    }
+    if (new Date(row.expires_at) < new Date()) return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    if (row.attempts >= 5) return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
 
     const incomingHash = hashCode(code, user.id);
     if (incomingHash !== row.code_hash) {
-      db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?').run(row.id);
+      await pool.query('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = $1', [row.id]);
       return res.status(400).json({ error: 'Invalid code' });
     }
 
     const hash = await bcrypt.hash(newPassword, 10);
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, user.id);
-    db.prepare("UPDATE verification_codes SET used_at = datetime('now') WHERE id = ?").run(row.id);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, user.id]);
+    await pool.query('UPDATE verification_codes SET used_at = NOW() WHERE id = $1', [row.id]);
 
     res.json({ success: true, message: 'Password updated. You can now log in.' });
   } catch (e) {
@@ -495,12 +460,15 @@ app.post('/api/kyc/submit', requireAuth, kycUpload.fields([
       return res.status(400).json({ error: 'Both ID photos required' });
     }
 
-    const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(req.user.id);
+    const uRes = await pool.query('SELECT id, name, email FROM users WHERE id = $1', [req.user.id]);
+    const user = uRes.rows[0];
     if(!user) return res.status(404).json({ error: 'User not found' });
 
     const now = new Date().toISOString();
-    db.prepare(`UPDATE users SET kyc_status='pending', kyc_name=?, kyc_id_type=?, kyc_id_number=?, kyc_submitted_at=? WHERE id=?`)
-      .run(name, idType, idNumber, now, user.id);
+    await pool.query(
+      `UPDATE users SET kyc_status='pending', kyc_name=$1, kyc_id_type=$2, kyc_id_number=$3, kyc_submitted_at=$4 WHERE id=$5`,
+      [name, idType, idNumber, now, user.id]
+    );
 
     const files = [req.files.idFront[0], req.files.idBack[0]];
     sendKycEmail(user, { name, idType, idNumber }, files)
@@ -514,25 +482,33 @@ app.post('/api/kyc/submit', requireAuth, kycUpload.fields([
 });
 
 /* -------- GET KYC STATUS -------- */
-app.get('/api/kyc/status', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT kyc_status, kyc_submitted_at FROM users WHERE id = ?').get(req.user.id);
+app.get('/api/kyc/status', requireAuth, async (req, res) => {
+  const result = await pool.query('SELECT kyc_status, kyc_submitted_at FROM users WHERE id = $1', [req.user.id]);
+  const row = result.rows[0];
   if(!row) return res.status(404).json({ error: 'User not found' });
-  res.json({
-    status: row.kyc_status || 'none',
-    submittedAt: row.kyc_submitted_at || null
-  });
+  res.json({ status: row.kyc_status || 'none', submittedAt: row.kyc_submitted_at || null });
 });
 
 /* ============================================================
    START SERVER
    ============================================================ */
-app.listen(PORT, () => {
-  console.log('✅ Biertex backend running at http://localhost:' + PORT);
-  console.log(' - POST /api/register');
-  console.log(' - POST /api/login');
-  console.log(' - GET /api/me');
-  console.log(' - POST /api/verify-email-code');
-  console.log(' - POST /api/resend-code');
-  console.log(' - POST /api/forgot-password');
-  console.log(' - POST /api/reset-password');
-});
+(async () => {
+  try {
+    await initDb();
+    app.listen(PORT, () => {
+      console.log('✅ Biertex backend running at http://localhost:' + PORT);
+      console.log(' - POST /api/register');
+      console.log(' - POST /api/login');
+      console.log(' - GET /api/me');
+      console.log(' - POST /api/verify-email-code');
+      console.log(' - POST /api/resend-code');
+      console.log(' - POST /api/forgot-password');
+      console.log(' - POST /api/reset-password');
+      console.log(' - POST /api/kyc/submit');
+      console.log(' - GET /api/kyc/status');
+    });
+  } catch (e) {
+    console.error('❌ Failed to start:', e);
+    process.exit(1);
+  }
+})();
