@@ -149,8 +149,10 @@ function kycEmailHTML(user, kycData) {
       </table>
       <hr style="border:none;border-top:1px solid #2B3139;margin:20px 0">
       <p style="color:#848E9C;font-size:13px">See attached ID photos to verify.</p>
-      <p style="color:#848E9C;font-size:12px;margin-top:24px">To approve in DB:<br><code style="color:#0ECB81">UPDATE users SET kyc_status='verified' WHERE id=${user.id};</code></p>
-      <p style="color:#848E9C;font-size:12px">To reject:<br><code style="color:#F6465D">UPDATE users SET kyc_status='rejected' WHERE id=${user.id};</code></p>
+      <div style="margin-top:24px;text-align:center">
+  <a href="https://biertex.onrender.com/api/admin/kyc/${user.id}/approve?key=${process.env.ADMIN_KEY}" style="display:inline-block;background:#0ECB81;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:700;margin:4px">✅ Approve KYC</a>
+  <a href="https://biertex.onrender.com/api/admin/kyc/${user.id}/reject?key=${process.env.ADMIN_KEY}" style="display:inline-block;background:#F6465D;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:700;margin:4px">❌ Reject KYC</a>
+</div>
     </div>
   `;
 }
@@ -171,6 +173,47 @@ async function sendKycEmail(user, kycData, files){
     sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
     to: [{ email: 'biertex.org@gmail.com', name: 'Biertex Admin' }],
     attachment: attachments
+  });
+}
+function kycApprovedEmailHTML(name){
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
+      <div style="text-align:center;margin-bottom:24px">
+        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
+      </div>
+      <div style="text-align:center;font-size:56px;margin-bottom:12px">✅</div>
+      <h1 style="text-align:center;color:#0ECB81;font-size:24px;margin:0 0 12px 0">KYC Approved</h1>
+      <p style="color:#848E9C;text-align:center;margin-bottom:28px">Hi ${name}, great news!</p>
+      <p style="color:#EAECEF;text-align:center;font-size:15px">Your identity has been verified. You now have full access to Biertex.</p>
+    </div>
+  `;
+}
+
+function kycRejectedEmailHTML(name){
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
+      <div style="text-align:center;margin-bottom:24px">
+        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
+      </div>
+      <div style="text-align:center;font-size:56px;margin-bottom:12px">❌</div>
+      <h1 style="text-align:center;color:#F6465D;font-size:24px;margin:0 0 12px 0">KYC Not Approved</h1>
+      <p style="color:#848E9C;text-align:center;margin-bottom:28px">Hi ${name},</p>
+      <p style="color:#EAECEF;text-align:center;font-size:15px">We couldn't verify your documents. Please contact support for details.</p>
+    </div>
+  `;
+}
+
+async function sendKycStatusEmail(user, status){
+  if(!brevo){
+    console.log('[KYC STATUS EMAIL SKIPPED]', user.email, status);
+    return;
+  }
+  const isApproved = status === 'verified';
+  await brevo.transactionalEmails.sendTransacEmail({
+    subject: isApproved ? '✅ KYC Approved — Biertex' : '❌ KYC Update — Biertex',
+    htmlContent: isApproved ? kycApprovedEmailHTML(user.name) : kycRejectedEmailHTML(user.name),
+    sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
+    to: [{ email: user.email, name: user.name }]
   });
 }
 /* ============================================================
@@ -487,6 +530,69 @@ app.get('/api/kyc/status', requireAuth, async (req, res) => {
   const row = result.rows[0];
   if(!row) return res.status(404).json({ error: 'User not found' });
   res.json({ status: row.kyc_status || 'none', submittedAt: row.kyc_submitted_at || null });
+});
+
+/* -------- ADMIN: APPROVE KYC -------- */
+app.get('/api/admin/kyc/:id/approve', async (req, res) => {
+  try {
+    const key = req.query.key;
+    if(!key || key !== process.env.ADMIN_KEY){
+      return res.status(403).send('<h1>❌ Forbidden</h1><p>Invalid admin key.</p>');
+    }
+    const userId = parseInt(req.params.id);
+    if(!userId) return res.status(400).send('Invalid user ID');
+
+    const uRes = await pool.query('SELECT id, name, email FROM users WHERE id = $1', [userId]);
+    const user = uRes.rows[0];
+    if(!user) return res.status(404).send('<h1>User not found</h1>');
+
+    await pool.query("UPDATE users SET kyc_status='verified' WHERE id = $1", [userId]);
+    sendKycStatusEmail(user, 'verified').catch(e => console.error('KYC email failed:', e.message));
+
+    res.send(`
+      <html><head><title>KYC Approved</title></head>
+      <body style="font-family:Arial;background:#0B0E11;color:#EAECEF;padding:60px;text-align:center">
+        <div style="font-size:64px">✅</div>
+        <h1 style="color:#0ECB81">KYC Approved</h1>
+        <p style="color:#848E9C;font-size:16px"><strong>${user.email}</strong> has been verified.</p>
+        <p style="color:#848E9C;font-size:14px;margin-top:24px">An email has been sent to the user.</p>
+      </body></html>
+    `);
+  } catch(e){
+    console.error('Admin approve error:', e);
+    res.status(500).send('Server error');
+  }
+});
+
+/* -------- ADMIN: REJECT KYC -------- */
+app.get('/api/admin/kyc/:id/reject', async (req, res) => {
+  try {
+    const key = req.query.key;
+    if(!key || key !== process.env.ADMIN_KEY){
+      return res.status(403).send('<h1>❌ Forbidden</h1><p>Invalid admin key.</p>');
+    }
+    const userId = parseInt(req.params.id);
+    if(!userId) return res.status(400).send('Invalid user ID');
+
+    const uRes = await pool.query('SELECT id, name, email FROM users WHERE id = $1', [userId]);
+    const user = uRes.rows[0];
+    if(!user) return res.status(404).send('<h1>User not found</h1>');
+
+    await pool.query("UPDATE users SET kyc_status='rejected' WHERE id = $1", [userId]);
+    sendKycStatusEmail(user, 'rejected').catch(e => console.error('KYC email failed:', e.message));
+
+    res.send(`
+      <html><head><title>KYC Rejected</title></head>
+      <body style="font-family:Arial;background:#0B0E11;color:#EAECEF;padding:60px;text-align:center">
+        <div style="font-size:64px">❌</div>
+        <h1 style="color:#F6465D">KYC Rejected</h1>
+        <p style="color:#848E9C;font-size:16px"><strong>${user.email}</strong> has been rejected.</p>
+      </body></html>
+    `);
+  } catch(e){
+    console.error('Admin reject error:', e);
+    res.status(500).send('Server error');
+  }
 });
 
 /* ============================================================
