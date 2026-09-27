@@ -216,6 +216,42 @@ async function sendKycStatusEmail(user, status){
     to: [{ email: user.email, name: user.name }]
   });
 }
+function supportEmailHTML(user, subject, message){
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0B0E11;color:#EAECEF;padding:40px;border-radius:14px">
+      <div style="text-align:center;margin-bottom:24px">
+        <div style="display:inline-block;background:#F0B90B;color:#0B0E11;padding:8px 16px;border-radius:10px;font-weight:800;font-size:18px">◈ BIERTEX</div>
+      </div>
+      <h1 style="color:#F0B90B;font-size:22px;margin:0 0 20px 0">📩 Support Request</h1>
+      <table style="width:100%;color:#EAECEF;font-size:14px;border-collapse:collapse">
+        <tr><td style="padding:8px 0;color:#848E9C;width:120px">From</td><td>${user ? user.name : 'Anonymous'}</td></tr>
+        <tr><td style="padding:8px 0;color:#848E9C">Email</td><td>${user ? user.email : 'Not logged in'}</td></tr>
+        <tr><td style="padding:8px 0;color:#848E9C">User ID</td><td>${user ? '#' + user.id : '—'}</td></tr>
+        <tr><td style="padding:8px 0;color:#848E9C">Time</td><td>${new Date().toUTCString()}</td></tr>
+      </table>
+      <hr style="border:none;border-top:1px solid #2B3139;margin:20px 0">
+      <h3 style="color:#EAECEF;margin:0 0 12px 0">${subject}</h3>
+      <div style="background:#12161C;border:1px solid #2B3139;border-radius:12px;padding:20px;color:#EAECEF;font-size:14px;white-space:pre-wrap;line-height:1.6">${message}</div>
+      <p style="color:#848E9C;font-size:12px;margin-top:24px">Reply directly to this email to reach the user.</p>
+    </div>
+  `;
+}
+
+async function sendSupportEmail(user, subject, message){
+  if(!brevo){
+    console.log('[SUPPORT EMAIL SKIPPED]', subject);
+    return;
+  }
+  const emailOpts = {
+    subject: `📩 Support: ${subject}`,
+    htmlContent: supportEmailHTML(user, subject, message),
+    sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
+    to: [{ email: 'biertex.org@gmail.com', name: 'Biertex Support' }]
+  };
+  if(user) emailOpts.replyTo = { email: user.email, name: user.name };
+
+  await brevo.transactionalEmails.sendTransacEmail(emailOpts);
+}
 /* ============================================================
    DATABASE INIT
    ============================================================ */
@@ -532,6 +568,33 @@ app.get('/api/kyc/status', requireAuth, async (req, res) => {
   res.json({ status: row.kyc_status || 'none', submittedAt: row.kyc_submitted_at || null });
 });
 
+/* -------- SUPPORT TICKET -------- */
+app.post('/api/support', async (req, res) => {
+  try {
+    const { subject, message } = req.body;
+    if(!subject || subject.length < 2) return res.status(400).json({ error: 'Subject required' });
+    if(!message || message.length < 5) return res.status(400).json({ error: 'Message required' });
+
+    let user = null;
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if(token){
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const result = await pool.query('SELECT id, name, email FROM users WHERE id = $1', [decoded.id]);
+        user = result.rows[0] || null;
+      } catch(e){ /* anonymous */ }
+    }
+
+    sendSupportEmail(user, subject, message)
+      .catch(e => console.error('Support email failed:', e.message));
+
+    res.json({ success: true, message: 'Ticket received' });
+  } catch(e){
+    console.error('Support error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 /* -------- ADMIN: APPROVE KYC -------- */
 app.get('/api/admin/kyc/:id/approve', async (req, res) => {
   try {
