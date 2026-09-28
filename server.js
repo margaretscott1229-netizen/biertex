@@ -21,7 +21,13 @@ const DATABASE_URL = process.env.DATABASE_URL;
    MIDDLEWARE
    ============================================================ */
 app.use(cors());
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    if (req.originalUrl === '/api/webhook/shieldz') {
+      req.rawBody = buf;
+    }
+  }
+}));
 
 /* ============================================================
    DATABASE (PostgreSQL)
@@ -737,7 +743,154 @@ app.post('/api/admin/wallet/credit', async (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-    app.listen(PORT, () => {
+    /* ============================================================
+   SHIELDZ — DEPOSIT + WEBHOOK
+   ============================================================ */
+
+const SHIELDZ_API_BASE = 'https://shieldz.cash/api/v1';
+
+app.post('/api/wallet/deposit', requireAuth, async (req, res) => {
+  try {
+    if (!process.env.SHIELDZ_API_KEY) {
+      return res.status(500).json({ error: 'Deposits not configured' });
+    }
+    const { amount_usd_cents } = req.body || {};
+    const cents = parseInt(amount_usd_cents, 10);
+    if (!cents || cents < 100) {
+      return res.status(400).json({ error: 'Minimum deposit is $1.00' });
+    }
+    if (cents > 1000000) {
+      return res.status(400).json({ error: 'Maximum deposit is $10,000' });
+    }
+
+    const origin = req.headers.origin || 'https://biertex-org.pages.dev';
+    const returnUrl = origin + '/?deposit=success';
+
+    const payload = {
+      amount_usd_cents: cents,
+      customer_email: req.user.email,
+      memo: 'Biertex deposit',
+      metadata: { user_id: req.user.id },
+      return_url: returnUrl,
+    };
+
+    const shRes = await fetch(SHIELDZ_API_BASE + '/invoices', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + process.env.SHIELDZ_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const shData = await shRes.json();
+    if (!shRes.ok) {
+      console.error('Shieldz invoice create failed', shData);
+      return res.status(502).json({ error: shData.error || 'Payment provider error' });
+    }
+
+    res.json({
+      invoice_id: shData.id,
+      pay_url: shData.pay_url,
+      amount_usd_cents: shData.amount_usd_cents,
+      status: shData.status,
+    });
+  } catch (err) {
+    console.error('deposit route error', err);
+    res.status(500).json({ error: 'Failed to create deposit' });
+  }
+});
+
+app.post('/api/webhook/shieldz', async (req, res) => {
+  try {
+    const secret = process.env.SHIELDZ_WEBHOOK_SECRET;
+    if (!secret) {
+      console.warn('webhook: SHIELDZ_WEBHOOK_SECRET missing');
+      return res.status(200).json({ ok: true, ignored: 'no secret' });
+    }
+
+    const sigHeader = req.headers['x-shieldz-signature'] || '';
+    const rawBody = req.rawBody ? req.rawBody.toString('utf8') : '';
+    if (!rawBody) {
+      return res.status(200).json({ ok: true, ignored: 'no body' });
+    }
+
+    const parts = sigHeader.split(',');
+    const tPart = parts.find(p => p.startsWith('t='));
+    if (!tPart) return res.status(200).json({ ok: true, ignored: 'no t' });
+    const t = tPart.slice(2);
+
+    if (Math.abs(Math.floor(Date.now() / 1000) - Number(t)) > 300) {
+      console.warn('webhook: timestamp too old');
+      return res.status(200).json({ ok: true, ignored: 'stale' });
+    }
+
+    const expected = crypto.createHmac('sha256', secret)
+      .update(t + '.' + rawBody)
+      .digest('hex');
+    const sigs = parts.filter(p => p.startsWith('v1=')).map(p => p.slice(3));
+    const valid = sigs.some(s =>
+      s.length === expected.length &&
+      crypto.timingSafeEqual(Buffer.from(s), Buffer.from(expected))
+    );
+    if (!valid) {
+      console.warn('webhook: bad signature');
+      return res.status(200).json({ ok: true, ignored: 'bad sig' });
+    }
+
+    const event = JSON.parse(rawBody);
+    if (event.type !== 'invoice.paid') {
+      return res.status(200).json({ ok: true, ignored: event.type });
+    }
+
+    const invoice = event.data && event.data.invoice;
+    if (!invoice || !invoice.id) {
+      return res.status(200).json({ ok: true, ignored: 'no invoice' });
+    }
+
+    const meta = invoice.metadata || {};
+    const userId = parseInt(meta.user_id, 10);
+    if (!userId) {
+      console.warn('webhook: no user_id in metadata', invoice.id);
+      return res.status(200).json({ ok: true, ignored: 'no user_id' });
+    }
+
+    const cents = parseInt(invoice.amount_usd_cents, 10) || 0;
+    if (cents <= 0) {
+      return res.status(200).json({ ok: true, ignored: 'zero amount' });
+    }
+    const usdtAmount = cents / 100;
+
+    try {
+      const out = await wallet.applyEntry({
+        userId,
+        asset: 'USDT',
+        amount: usdtAmount,
+        type: 'deposit',
+        refId: 'shieldz:' + invoice.id,
+        metadata: {
+          invoice_id: invoice.id,
+          amount_usd_cents: cents,
+          delivery: req.headers['x-shieldz-delivery'] || null,
+        },
+      });
+      console.log('deposit credited', { userId, invoiceId: invoice.id, amount: usdtAmount });
+      return res.status(200).json({ ok: true, credited: usdtAmount, txId: out.txId });
+    } catch (err) {
+      if (String(err.message || '').includes('duplicate key') ||
+          String(err.message || '').includes('unique')) {
+        console.log('webhook: already credited', invoice.id);
+        return res.status(200).json({ ok: true, ignored: 'already credited' });
+      }
+      console.error('webhook: credit failed', err);
+      return res.status(200).json({ ok: true, error: 'credit failed' });
+    }
+  } catch (err) {
+    console.error('webhook: unexpected', err);
+    return res.status(200).json({ ok: true, error: 'handled' });
+  }
+});
+app.listen(PORT, () => {
       console.log('✅ Biertex backend running at http://localhost:' + PORT);
       console.log(' - POST /api/register');
       console.log(' - POST /api/login');
