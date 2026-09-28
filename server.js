@@ -944,6 +944,7 @@ app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
     }
 
     await pool.query('UPDATE withdrawals SET ref_id = $1 WHERE id = $2', [refId, withdrawal.id]);
+    notifyAdminNewWithdrawal(withdrawal, req.user).catch(e => console.error('admin email failed', e.message));
 
     res.json({
       id: withdrawal.id,
@@ -958,6 +959,177 @@ app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Failed to submit withdrawal request' });
   }
 });
+/* ============================================================
+   WITHDRAWALS — admin notify + approve/reject + admin page
+   ============================================================ */
+
+const ADMIN_EMAIL = 'biertex.org@gmail.com';
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
+async function notifyAdminNewWithdrawal(withdrawal, user) {
+  const adminLink = `https://biertex.onrender.com/admin/withdrawals?key=${process.env.ADMIN_KEY}#w${withdrawal.id}`;
+  const html = `
+    <div style="font-family:system-ui;max-width:520px">
+      <h2>New withdrawal request</h2>
+      <p><b>User:</b> ${escapeHtml(user.email)} (id ${user.id})</p>
+      <p><b>Amount:</b> ${withdrawal.amount} USDC</p>
+      <p><b>Address:</b> <code>${escapeHtml(withdrawal.address)}</code></p>
+      <p><b>Chain:</b> ${withdrawal.chain}</p>
+      <p><b>Submitted:</b> ${withdrawal.created_at}</p>
+      <hr>
+      <p>
+        <a href="${adminLink}" style="background:#16c784;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;display:inline-block">Open admin page</a>
+      </p>
+      <p style="color:#888;font-size:13px">
+        Send ${withdrawal.amount} USDC to the address above from your Trust Wallet (Base network), then paste the tx hash on the admin page.
+      </p>
+    </div>
+  `;
+  return sendEmail({
+    to: ADMIN_EMAIL,
+    toName: 'Biertex Admin',
+    subject: `Withdrawal #${withdrawal.id} — ${withdrawal.amount} USDC`,
+    html,
+  });
+}
+
+app.get('/api/admin/withdrawals/:id/complete', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(403).send('forbidden');
+  const id = parseInt(req.params.id, 10);
+  const tx = String(req.query.tx || '').trim();
+  if (!tx) return res.status(400).send('Missing tx hash');
+  try {
+    const wRes = await pool.query('SELECT * FROM withdrawals WHERE id = $1', [id]);
+    if (!wRes.rows.length) return res.status(404).send('Not found');
+    const w = wRes.rows[0];
+    if (w.status === 'completed') return res.send('Already completed');
+    if (w.status !== 'pending_approval') return res.status(400).send('Cannot complete, status = ' + w.status);
+
+    await pool.query(
+      `UPDATE withdrawals SET status = 'completed', tx_hash = $1, completed_at = NOW() WHERE id = $2`,
+      [tx, id]
+    );
+
+    await pool.query(
+      `INSERT INTO wallet_transactions (user_id, asset, amount, type, ref_id, metadata)
+       VALUES ($1, 'USDT', 0, 'withdrawal_completed', $2, $3)
+       ON CONFLICT (type, ref_id) DO NOTHING`,
+      [w.user_id, 'withdrawal_completed:' + id, { withdrawal_id: id, tx_hash: tx }]
+    );
+
+    res.send(`Withdrawal #${id} marked as completed.\nTx: ${tx}`);
+  } catch (e) {
+    console.error('admin complete error', e);
+    res.status(500).send('Error: ' + e.message);
+  }
+});
+
+app.get('/api/admin/withdrawals/:id/reject', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(403).send('forbidden');
+  const id = parseInt(req.params.id, 10);
+  const reason = String(req.query.reason || '').trim() || 'Rejected by admin';
+  try {
+    const wRes = await pool.query('SELECT * FROM withdrawals WHERE id = $1', [id]);
+    if (!wRes.rows.length) return res.status(404).send('Not found');
+    const w = wRes.rows[0];
+    if (w.status === 'rejected') return res.send('Already rejected');
+    if (w.status !== 'pending_approval') return res.status(400).send('Cannot reject, status = ' + w.status);
+
+    await wallet.applyEntry({
+      userId: w.user_id,
+      asset: 'USDT',
+      amount: Number(w.amount),
+      type: 'withdrawal_refund',
+      refId: 'withdrawal_refund:' + id,
+      metadata: { withdrawal_id: id, reason },
+    });
+
+    await pool.query(
+      `UPDATE withdrawals SET status = 'rejected', admin_note = $1, rejected_at = NOW() WHERE id = $2`,
+      [reason, id]
+    );
+
+    res.send(`Withdrawal #${id} rejected.\nBalance refunded.\nReason: ${reason}`);
+  } catch (e) {
+    console.error('admin reject error', e);
+    res.status(500).send('Error: ' + e.message);
+  }
+});
+
+app.get('/admin/withdrawals', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(403).send('forbidden');
+  try {
+    const { rows } = await pool.query(
+      `SELECT w.id, w.user_id, w.amount, w.address, w.chain, w.created_at, u.email
+       FROM withdrawals w JOIN users u ON u.id = w.user_id
+       WHERE w.status = 'pending_approval'
+       ORDER BY w.created_at ASC`
+    );
+
+    const cards = rows.map(w => `
+      <div class="card" id="w${w.id}">
+        <div class="row"><span class="muted">Withdrawal #${w.id}</span><span class="muted">${new Date(w.created_at).toLocaleString()}</span></div>
+        <div class="amt">${w.amount} USDC</div>
+        <div class="row"><span class="muted">User</span><span>${escapeHtml(w.email)} (id ${w.user_id})</span></div>
+        <div class="row"><span class="muted">Address</span><span style="font-family:monospace;word-break:break-all;text-align:right">${escapeHtml(w.address)}</span></div>
+        <div class="row"><span class="muted">Chain</span><span>${w.chain}</span></div>
+        <hr>
+        <p class="muted">1. Send <b>${w.amount} USDC</b> to the address above from Trust Wallet (Base network).</p>
+        <p class="muted">2. Paste the tx hash here and click Complete.</p>
+        <input type="text" id="tx${w.id}" placeholder="0x... tx hash">
+        <div style="margin-top:12px">
+          <button class="btn-green" onclick="completeW(${w.id})">Complete</button>
+          <button class="btn-red" onclick="rejectW(${w.id})">Reject</button>
+        </div>
+      </div>
+    `).join('');
+
+    res.send(`<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Biertex — Pending withdrawals</title>
+<style>
+  body{font-family:system-ui;background:#0b0e11;color:#eaecef;padding:16px;max-width:640px;margin:0 auto}
+  .card{background:#1e2329;border-radius:8px;padding:16px;margin-bottom:12px}
+  .row{display:flex;justify-content:space-between;margin:4px 0;gap:12px}
+  .amt{color:#f0b90b;font-weight:bold;font-size:22px;margin:8px 0}
+  input{width:100%;padding:10px;border-radius:6px;border:1px solid #333;background:#0b0e11;color:#eaecef;font-family:monospace;box-sizing:border-box}
+  button{padding:10px 16px;border-radius:6px;border:none;cursor:pointer;font-weight:bold;margin-right:8px}
+  .btn-green{background:#16c784;color:white}
+  .btn-red{background:#ea3943;color:white}
+  .muted{color:#888;font-size:13px}
+  hr{border:none;border-top:1px solid #333;margin:12px 0}
+</style></head><body>
+<h1>Pending withdrawals</h1>
+${rows.length ? cards : '<div style="text-align:center;color:#888;padding:40px 20px">No pending withdrawals.</div>'}
+<script>
+  const KEY = ${JSON.stringify(process.env.ADMIN_KEY)};
+  async function completeW(id){
+    const tx = document.getElementById('tx'+id).value.trim();
+    if(!tx) return alert('Paste the tx hash first');
+    const r = await fetch('/api/admin/withdrawals/'+id+'/complete?key='+encodeURIComponent(KEY)+'&tx='+encodeURIComponent(tx));
+    alert(await r.text());
+    if(r.ok) location.reload();
+  }
+  async function rejectW(id){
+    const reason = prompt('Reason for rejection?','Rejected by admin');
+    if(reason === null) return;
+    const r = await fetch('/api/admin/withdrawals/'+id+'/reject?key='+encodeURIComponent(KEY)+'&reason='+encodeURIComponent(reason));
+    alert(await r.text());
+    if(r.ok) location.reload();
+  }
+</script>
+</body></html>`);
+  } catch (e) {
+    console.error('admin page error', e);
+    res.status(500).send('Error: ' + e.message);
+  }
+});
+
 app.listen(PORT, () => {
       console.log('✅ Biertex backend running at http://localhost:' + PORT);
       console.log(' - POST /api/register');
