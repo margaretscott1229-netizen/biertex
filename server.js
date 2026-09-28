@@ -1014,11 +1014,10 @@ app.get('/api/admin/withdrawals/:id/complete', async (req, res) => {
     );
 
     await pool.query(
-      `INSERT INTO wallet_transactions (user_id, asset, amount, type, ref_id, metadata)
-       VALUES ($1, 'USDT', 0, 'withdrawal_completed', $2, $3)
-       ON CONFLICT (type, ref_id) DO NOTHING`,
-      [w.user_id, 'withdrawal_completed:' + id, { withdrawal_id: id, tx_hash: tx }]
-    );
+  `INSERT INTO wallet_transactions (user_id, asset, amount, type, ref_id, metadata)
+   VALUES ($1, 'USDT', 0, 'withdrawal_completed', $2, $3)`,
+  [w.user_id, 'withdrawal_completed:' + id, { withdrawal_id: id, tx_hash: tx }]
+);
 
     res.send(`Withdrawal #${id} marked as completed.\nTx: ${tx}`);
   } catch (e) {
