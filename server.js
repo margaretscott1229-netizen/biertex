@@ -892,6 +892,72 @@ app.post('/api/webhook/shieldz', async (req, res) => {
     return res.status(200).json({ ok: true, error: 'handled' });
   }
 });
+/* ============================================================
+   WITHDRAWALS — request (user side)
+   ============================================================ */
+
+app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
+  try {
+    const { amount, address } = req.body || {};
+    const amt = Number(amount);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+    if (amt < 10) return res.status(400).json({ error: 'Minimum withdrawal is $10' });
+    if (amt > 500) return res.status(400).json({ error: 'Maximum withdrawal is $500' });
+    if (typeof address !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
+      return res.status(400).json({ error: 'Invalid wallet address' });
+    }
+
+    const uRes = await pool.query(
+      'SELECT withdrawals_enabled FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    if (!uRes.rows.length) return res.status(404).json({ error: 'User not found' });
+    if (!uRes.rows[0].withdrawals_enabled) {
+      return res.status(403).json({ error: 'Withdrawals are locked. Complete KYC to unlock.' });
+    }
+
+    const wRes = await pool.query(
+      `INSERT INTO withdrawals (user_id, asset, amount, address, chain, status)
+       VALUES ($1, 'USDC', $2, $3, 'BASE', 'pending_approval')
+       RETURNING id, created_at`,
+      [req.user.id, amt, address]
+    );
+    const withdrawal = wRes.rows[0];
+    const refId = 'withdrawal:' + withdrawal.id;
+
+    try {
+      await wallet.applyEntry({
+        userId: req.user.id,
+        asset: 'USDT',
+        amount: -amt,
+        type: 'withdrawal_lock',
+        refId,
+        metadata: { withdrawal_id: withdrawal.id, address, chain: 'BASE' },
+      });
+    } catch (lockErr) {
+      await pool.query('DELETE FROM withdrawals WHERE id = $1', [withdrawal.id]);
+      const msg = String(lockErr.message || '');
+      if (msg.includes('Insufficient')) {
+        return res.status(400).json({ error: 'Insufficient balance' });
+      }
+      throw lockErr;
+    }
+
+    await pool.query('UPDATE withdrawals SET ref_id = $1 WHERE id = $2', [refId, withdrawal.id]);
+
+    res.json({
+      id: withdrawal.id,
+      amount: amt,
+      address,
+      chain: 'BASE',
+      status: 'pending_approval',
+      created_at: withdrawal.created_at,
+    });
+  } catch (err) {
+    console.error('withdraw route error', err);
+    res.status(500).json({ error: 'Failed to submit withdrawal request' });
+  }
+});
 app.listen(PORT, () => {
       console.log('✅ Biertex backend running at http://localhost:' + PORT);
       console.log(' - POST /api/register');
