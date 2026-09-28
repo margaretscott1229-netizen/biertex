@@ -919,7 +919,7 @@ app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
     const wRes = await pool.query(
       `INSERT INTO withdrawals (user_id, asset, amount, address, chain, status)
        VALUES ($1, 'USDC', $2, $3, 'BASE', 'pending_approval')
-       RETURNING id, created_at`,
+       RETURNING id, amount, address, chain, created_at`,
       [req.user.id, amt, address]
     );
     const withdrawal = wRes.rows[0];
