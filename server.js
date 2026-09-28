@@ -835,6 +835,8 @@ app.post('/api/webhook/shieldz', async (req, res) => {
     );
     if (!valid) {
       console.warn('webhook: bad signature');
+      console.warn('DEBUG sig check', { secretLen: secret.length, t, rawLen: rawBody.length, expected16: expected.slice(0,16), got16: sigs.map(x => x.slice(0,16)), rawStart: rawBody.slice(0, 60) });
+
       return res.status(200).json({ ok: true, ignored: 'bad sig' });
     }
 
