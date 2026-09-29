@@ -9,12 +9,12 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const multer = require('multer');
-const { BrevoClient } = require('@getbrevo/brevo');
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
-const BREVO_API_KEY = process.env.BREVO_API_KEY;
+
 const DATABASE_URL = process.env.DATABASE_URL;
 
 /* ============================================================
@@ -51,14 +51,13 @@ const kycUpload = multer({
 });
 
 /* ============================================================
-   BREVO CLIENT
+   MAILTRAP CLIENT
    ============================================================ */
-let brevo = null;
-if (BREVO_API_KEY) {
-  brevo = new BrevoClient({ apiKey: BREVO_API_KEY });
-  console.log('✅ Brevo client initialized');
+const MAILTRAP_API_TOKEN = process.env.MAILTRAP_API_TOKEN;
+if (MAILTRAP_API_TOKEN) {
+  console.log('✅ Mailtrap configured');
 } else {
-  console.warn('⚠️ BREVO_API_KEY not set — emails will be skipped');
+  console.warn('⚠️ MAILTRAP_API_TOKEN not set — emails will be skipped');
 }
 
 /* ============================================================
@@ -92,17 +91,33 @@ function hashCode(code, userId) {
   return crypto.createHash('sha256').update(code + ':' + userId + ':' + JWT_SECRET).digest('hex');
 }
 
-async function sendEmail({ to, toName, subject, html }) {
-  if (!brevo) {
+async function sendEmail({ to, toName, subject, html, attachments }) {
+  if (!process.env.MAILTRAP_API_TOKEN) {
     console.log('[EMAIL SKIPPED]', subject, '→', to);
     return;
   }
-  return await brevo.transactionalEmails.sendTransacEmail({
+  const body = {
+    from: { name: 'Biertex', email: 'noreply@biertex.com' },
+    to: [{ email: to, name: toName || to }],
     subject,
-    htmlContent: html,
-    sender: { name: 'Biertex', email: 'noreply@biertex.com' },
-    to: [{ email: to, name: toName }]
+    html
+  };
+  if (attachments) body.attachments = attachments;
+
+  const r = await fetch('https://send.api.mailtrap.io/api/send', {
+    method: 'POST',
+    headers: {
+      'Api-Token': process.env.MAILTRAP_API_TOKEN,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
   });
+  const data = await r.json();
+  if (!r.ok) {
+    console.error('Mailtrap error:', data);
+    throw new Error('Mailtrap send failed');
+  }
+  return data;
 }
 
 function verificationEmailHTML(name, code) {
@@ -169,22 +184,22 @@ function kycEmailHTML(user, kycData) {
 }
 
 async function sendKycEmail(user, kycData, files){
-  if(!brevo){
+  if(!process.env.MAILTRAP_API_TOKEN){
     console.log('[KYC EMAIL SKIPPED]', user.email);
     return;
   }
   const attachments = files.map(f => ({
-    name: f.originalname,
+    filename: f.originalname,
     content: f.buffer.toString('base64')
   }));
 
-  await brevo.transactionalEmails.sendTransacEmail({
-    subject: `📋 KYC Submission — ${user.name}`,
-    htmlContent: kycEmailHTML(user, kycData),
-    sender: { name: 'Biertex', email: 'noreply@biertex.com' },
-    to: [{ email: 'biertex.org@gmail.com', name: 'Biertex Admin' }],
-    attachment: attachments
-  });
+  await sendEmail({
+  to: 'biertex.org@gmail.com',
+  toName: 'Biertex Admin',
+  subject: `📋 KYC Submission — ${user.name}`,
+  html: kycEmailHTML(user, kycData),
+  attachments: attachments
+});
 }
 function kycApprovedEmailHTML(name){
   return `
@@ -215,16 +230,12 @@ function kycRejectedEmailHTML(name){
 }
 
 async function sendKycStatusEmail(user, status){
-  if(!brevo){
-    console.log('[KYC STATUS EMAIL SKIPPED]', user.email, status);
-    return;
-  }
   const isApproved = status === 'verified';
-  await brevo.transactionalEmails.sendTransacEmail({
+  await sendEmail({
+    to: user.email,
+    toName: user.name,
     subject: isApproved ? '✅ KYC Approved — Biertex' : '❌ KYC Update — Biertex',
-    htmlContent: isApproved ? kycApprovedEmailHTML(user.name) : kycRejectedEmailHTML(user.name),
-    sender: { name: 'Biertex', email: 'noreply@biertex.com' },
-    to: [{ email: user.email, name: user.name }]
+    html: isApproved ? kycApprovedEmailHTML(user.name) : kycRejectedEmailHTML(user.name)
   });
 }
 function supportEmailHTML(user, subject, message){
@@ -249,19 +260,12 @@ function supportEmailHTML(user, subject, message){
 }
 
 async function sendSupportEmail(user, subject, message){
-  if(!brevo){
-    console.log('[SUPPORT EMAIL SKIPPED]', subject);
-    return;
-  }
-  const emailOpts = {
+  await sendEmail({
+    to: 'biertex.org@gmail.com',
+    toName: 'Biertex Support',
     subject: `📩 Support: ${subject}`,
-    htmlContent: supportEmailHTML(user, subject, message),
-    sender: { name: 'Biertex', email: 'noreply@biertex.com' },
-    to: [{ email: 'biertex.org@gmail.com', name: 'Biertex Support' }]
-  };
-  if(user) emailOpts.replyTo = { email: user.email, name: user.name };
-
-  await brevo.transactionalEmails.sendTransacEmail(emailOpts);
+    html: supportEmailHTML(user, subject, message)
+  });
 }
 /* ============================================================
    DATABASE INIT
