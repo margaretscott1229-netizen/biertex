@@ -181,7 +181,7 @@ async function sendKycEmail(user, kycData, files){
   await brevo.transactionalEmails.sendTransacEmail({
     subject: `📋 KYC Submission — ${user.name}`,
     htmlContent: kycEmailHTML(user, kycData),
-    sender: { name: 'Biertex', email: 'noreply@biertex.com' },,
+    sender: { name: 'Biertex', email: 'noreply@biertex.com' },
     to: [{ email: 'biertex.org@gmail.com', name: 'Biertex Admin' }],
     attachment: attachments
   });
