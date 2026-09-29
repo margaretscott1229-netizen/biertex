@@ -97,7 +97,7 @@ async function sendEmail({ to, toName, subject, html }) {
     console.log('[EMAIL SKIPPED]', subject, '→', to);
     return;
   }
-  await brevo.transactionalEmails.sendTransacEmail({
+  return await brevo.transactionalEmails.sendTransacEmail({
     subject,
     htmlContent: html,
     sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
