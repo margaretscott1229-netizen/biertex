@@ -100,7 +100,7 @@ async function sendEmail({ to, toName, subject, html }) {
   return await brevo.transactionalEmails.sendTransacEmail({
     subject,
     htmlContent: html,
-    sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
+    sender: { name: 'Biertex', email: 'noreply@biertex.com' },
     to: [{ email: to, name: toName }]
   });
 }
@@ -181,7 +181,7 @@ async function sendKycEmail(user, kycData, files){
   await brevo.transactionalEmails.sendTransacEmail({
     subject: `📋 KYC Submission — ${user.name}`,
     htmlContent: kycEmailHTML(user, kycData),
-    sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
+    sender: { name: 'Biertex', email: 'noreply@biertex.com' },,
     to: [{ email: 'biertex.org@gmail.com', name: 'Biertex Admin' }],
     attachment: attachments
   });
@@ -223,7 +223,7 @@ async function sendKycStatusEmail(user, status){
   await brevo.transactionalEmails.sendTransacEmail({
     subject: isApproved ? '✅ KYC Approved — Biertex' : '❌ KYC Update — Biertex',
     htmlContent: isApproved ? kycApprovedEmailHTML(user.name) : kycRejectedEmailHTML(user.name),
-    sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
+    sender: { name: 'Biertex', email: 'noreply@biertex.com' },
     to: [{ email: user.email, name: user.name }]
   });
 }
@@ -256,7 +256,7 @@ async function sendSupportEmail(user, subject, message){
   const emailOpts = {
     subject: `📩 Support: ${subject}`,
     htmlContent: supportEmailHTML(user, subject, message),
-    sender: { name: 'Biertex', email: 'biertex.org@gmail.com' },
+    sender: { name: 'Biertex', email: 'noreply@biertex.com' },
     to: [{ email: 'biertex.org@gmail.com', name: 'Biertex Support' }]
   };
   if(user) emailOpts.replyTo = { email: user.email, name: user.name };
