@@ -490,7 +490,7 @@ app.post('/api/forgot-password', async (req, res) => {
         toName: user.name,
         subject: 'Your Biertex password reset code',
         html: resetEmailHTML(user.name, code)
-      }).catch(e => console.error('Reset email failed:', e.message));
+      }).then(r => console.log('FORGOT EMAIL SENT:', JSON.stringify(r))).catch(e => console.error('Reset email FULL ERROR:', e));
     }
 
     res.json({ success: true, message: 'If that email exists, we sent a reset code.' });
