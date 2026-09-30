@@ -1202,6 +1202,160 @@ app.post('/api/yield/lock', requireAuth, async (req, res) => {
   }
 });
 
+/* ============================================================
+   YIELD POOL — POSITIONS + MATURITY + ADMIN PAYOUT
+   ============================================================ */
+
+app.get('/api/yield/positions', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, amount, rate_monthly, status, started_at, matures_at, matured_at, withdrawn_at, payout_total
+       FROM yield_deposits WHERE user_id = $1 ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    res.json({
+      positions: rows.map(r => ({
+        id: r.id,
+        amount: Number(r.amount),
+        rate_monthly: Number(r.rate_monthly),
+        status: r.status,
+        started_at: r.started_at,
+        matures_at: r.matures_at,
+        matured_at: r.matured_at,
+        withdrawn_at: r.withdrawn_at,
+        projected_payout: r.payout_total
+          ? Number(r.payout_total)
+          : Number(r.amount) * (1 + Number(r.rate_monthly)),
+      })),
+    });
+  } catch (err) {
+    console.error('yield positions error', err);
+    res.status(500).json({ error: 'Failed to load positions' });
+  }
+});
+
+app.post('/api/admin/yield/mature-check', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE yield_deposits SET status = 'matured', matured_at = NOW()
+       WHERE status = 'active' AND matures_at <= NOW()`
+    );
+    res.json({ ok: true, marked: rowCount });
+  } catch (err) {
+    console.error('mature check error', err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+app.post('/api/admin/yield/:id/payout', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+  const id = parseInt(req.params.id, 10);
+  try {
+    const wRes = await pool.query('SELECT * FROM yield_deposits WHERE id = $1', [id]);
+    if (!wRes.rows.length) return res.status(404).json({ error: 'Not found' });
+    const y = wRes.rows[0];
+    if (y.status === 'withdrawn') return res.json({ ok: true, ignored: 'already paid' });
+    if (y.status !== 'matured') return res.status(400).json({ error: 'Not matured yet (status=' + y.status + ')' });
+
+    const principal = Number(y.amount);
+    const rate = Number(y.rate_monthly);
+    const payout = principal * (1 + rate);
+
+    await wallet.applyEntry({
+      userId: y.user_id,
+      asset: 'USDT',
+      amount: payout,
+      type: 'yield_payout',
+      refId: 'yield_payout:' + id,
+      metadata: { yield_id: id, principal, rate, payout },
+    });
+
+    await pool.query(
+      `UPDATE yield_deposits SET status = 'withdrawn', withdrawn_at = NOW(), payout_total = $1 WHERE id = $2`,
+      [payout, id]
+    );
+
+    res.json({ ok: true, id, payout, principal, interest: payout - principal });
+  } catch (err) {
+    const msg = String(err.message || '');
+    if (msg.includes('duplicate key') || msg.includes('unique')) {
+      return res.json({ ok: true, ignored: 'already paid' });
+    }
+    console.error('yield payout error', err);
+    res.status(500).json({ error: 'Payout failed' });
+  }
+});
+
+app.get('/admin/yield', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(403).send('forbidden');
+  try {
+    const sRes = await pool.query('SELECT * FROM yield_settings WHERE id = 1');
+    const settings = sRes.rows[0] || {};
+    const { rows } = await pool.query(
+      `SELECT y.id, y.user_id, y.amount, y.rate_monthly, y.matures_at, u.email
+       FROM yield_deposits y JOIN users u ON u.id = y.user_id
+       WHERE y.status = 'matured' ORDER BY y.matures_at ASC`
+    );
+
+    const cards = rows.map(y => {
+      const payout = Number(y.amount) * (1 + Number(y.rate_monthly));
+      return `
+        <div class="card" id="y${y.id}">
+          <div class="row"><span class="muted">Position #${y.id}</span><span class="muted">${new Date(y.matures_at).toLocaleString()}</span></div>
+          <div class="amt">${payout.toFixed(2)} USDT payout</div>
+          <div class="row"><span class="muted">User</span><span>${escapeHtml(y.email)} (id ${y.user_id})</span></div>
+          <div class="row"><span class="muted">Principal</span><span>${Number(y.amount).toFixed(2)} USDT</span></div>
+          <div class="row"><span class="muted">Rate</span><span>${(Number(y.rate_monthly)*100).toFixed(2)}%</span></div>
+          <div class="row"><span class="muted">Interest</span><span>${(payout - Number(y.amount)).toFixed(2)} USDT</span></div>
+          <hr>
+          <button class="btn-green" onclick="payout(${y.id})">Approve payout</button>
+        </div>`;
+    }).join('');
+
+    res.send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Biertex — Yield Payouts</title>
+<style>
+  body{font-family:system-ui;background:#0b0e11;color:#eaecef;padding:16px;max-width:640px;margin:0 auto}
+  .card{background:#1e2329;border-radius:8px;padding:16px;margin-bottom:12px}
+  .row{display:flex;justify-content:space-between;margin:4px 0;gap:12px}
+  .amt{color:#f0b90b;font-weight:bold;font-size:22px;margin:8px 0}
+  button{padding:10px 16px;border-radius:6px;border:none;cursor:pointer;font-weight:bold;margin-right:8px}
+  .btn-green{background:#16c784;color:white}
+  .muted{color:#888;font-size:13px}
+  hr{border:none;border-top:1px solid #333;margin:12px 0}
+  .top{background:#1e2329;padding:14px;border-radius:8px;margin-bottom:16px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+  .top span{font-size:13px;color:#c9ced6}
+</style></head><body>
+<h1>Yield Payouts</h1>
+<div class="top">
+  <span>Rate: <b style="color:#f0b90b">${(Number(settings.current_rate_monthly||0)*100).toFixed(2)}%</b> monthly</span>
+  <span>Pool: <b>${settings.pool_enabled ? 'OPEN' : 'CLOSED'}</b></span>
+</div>
+<button class="btn-green" style="margin-bottom:16px" onclick="runMature()">Run maturity check</button>
+${rows.length ? cards : '<div style="text-align:center;color:#888;padding:40px 20px">No matured positions awaiting payout.</div>'}
+<script>
+  const KEY = ${JSON.stringify(process.env.ADMIN_KEY)};
+  async function payout(id){
+    if(!confirm('Approve payout for position #'+id+'?')) return;
+    const r = await fetch('/api/admin/yield/'+id+'/payout?key='+encodeURIComponent(KEY), {method:'POST'});
+    alert(JSON.stringify(await r.json()));
+    if(r.ok) location.reload();
+  }
+  async function runMature(){
+    const r = await fetch('/api/admin/yield/mature-check?key='+encodeURIComponent(KEY), {method:'POST'});
+    alert(JSON.stringify(await r.json()));
+    location.reload();
+  }
+</script>
+</body></html>`);
+  } catch (e) {
+    console.error('admin yield page error', e);
+    res.status(500).send('Error: ' + e.message);
+  }
+});
+
 app.listen(PORT, () => {
       console.log('✅ Biertex backend running at http://localhost:' + PORT);
       console.log(' - POST /api/register');
