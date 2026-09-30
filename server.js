@@ -1133,6 +1133,75 @@ ${rows.length ? cards : '<div style="text-align:center;color:#888;padding:40px 2
   }
 });
 
+/* ============================================================
+   YIELD POOL — USER ENDPOINTS
+   ============================================================ */
+
+app.post('/api/yield/lock', requireAuth, async (req, res) => {
+  try {
+    const { amount } = req.body || {};
+    const amt = Number(amount);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+    const sRes = await pool.query('SELECT * FROM yield_settings WHERE id = 1');
+    if (!sRes.rows.length) return res.status(500).json({ error: 'Yield not configured' });
+    const settings = sRes.rows[0];
+
+    if (!settings.pool_enabled) {
+      return res.status(403).json({ error: 'Yield pool is currently closed' });
+    }
+    if (amt < Number(settings.min_deposit)) {
+      return res.status(400).json({ error: 'Minimum deposit is ' + settings.min_deposit + ' USDT' });
+    }
+    if (amt > Number(settings.max_per_user)) {
+      return res.status(400).json({ error: 'Maximum per deposit is ' + settings.max_per_user + ' USDT' });
+    }
+
+    const rate = Number(settings.current_rate_monthly);
+    const maturesAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+    const yRes = await pool.query(
+      `INSERT INTO yield_deposits (user_id, amount, rate_monthly, status, matures_at)
+       VALUES ($1, $2, $3, 'active', $4)
+       RETURNING id, started_at, matures_at`,
+      [req.user.id, amt, rate, maturesAt]
+    );
+    const deposit = yRes.rows[0];
+    const refId = 'yield_lock:' + deposit.id;
+
+    try {
+      await wallet.applyEntry({
+        userId: req.user.id,
+        asset: 'USDT',
+        amount: -amt,
+        type: 'yield_lock',
+        refId,
+        metadata: { yield_id: deposit.id, rate_monthly: rate },
+      });
+    } catch (lockErr) {
+      await pool.query('DELETE FROM yield_deposits WHERE id = $1', [deposit.id]);
+      const msg = String(lockErr.message || '');
+      if (msg.includes('Insufficient')) {
+        return res.status(400).json({ error: 'Insufficient balance' });
+      }
+      throw lockErr;
+    }
+
+    res.json({
+      id: deposit.id,
+      amount: amt,
+      rate_monthly: rate,
+      status: 'active',
+      started_at: deposit.started_at,
+      matures_at: deposit.matures_at,
+      projected_payout: amt * (1 + rate),
+    });
+  } catch (err) {
+    console.error('yield lock error', err);
+    res.status(500).json({ error: 'Failed to lock funds' });
+  }
+});
+
 app.listen(PORT, () => {
       console.log('✅ Biertex backend running at http://localhost:' + PORT);
       console.log(' - POST /api/register');
