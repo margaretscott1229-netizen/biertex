@@ -1355,7 +1355,120 @@ ${rows.length ? cards : '<div style="text-align:center;color:#888;padding:40px 2
     res.status(500).send('Error: ' + e.message);
   }
 });
+/* ============================================================
+   YIELD POOL — PARTIAL WITHDRAWALS (day 15 profit / day 30 all)
+   ============================================================ */
 
+const YIELD_PERIOD_DAYS = 30;
+const YIELD_PROFIT_DAY = 15;
+
+function daysSince(dateStr){
+  return (Date.now() - new Date(dateStr).getTime()) / (1000 * 60 * 60 * 24);
+}
+
+app.post('/api/yield/:id/withdraw-profit', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const wRes = await pool.query(
+      'SELECT * FROM yield_deposits WHERE id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+    if (!wRes.rows.length) return res.status(404).json({ error: 'Position not found' });
+    const y = wRes.rows[0];
+
+    if (y.status !== 'active') return res.status(400).json({ error: 'Position not active' });
+    if (y.profit_withdrawn_at) return res.status(400).json({ error: 'Profit already withdrawn' });
+
+    const days = daysSince(y.started_at);
+    if (days < YIELD_PROFIT_DAY) {
+      return res.status(400).json({ error: 'Profit withdrawal available after day ' + YIELD_PROFIT_DAY });
+    }
+    if (days >= YIELD_PERIOD_DAYS) {
+      return res.status(400).json({ error: 'Full withdrawal available — use withdraw-all' });
+    }
+
+    const principal = Number(y.amount);
+    const rate = Number(y.rate_monthly);
+    const profit = principal * rate * (YIELD_PROFIT_DAY / YIELD_PERIOD_DAYS);
+
+    await wallet.applyEntry({
+      userId: req.user.id,
+      asset: 'USDT',
+      amount: profit,
+      type: 'yield_profit',
+      refId: 'yield_profit:' + id,
+      metadata: { yield_id: id, principal, rate, profit, day: YIELD_PROFIT_DAY },
+    });
+
+    await pool.query(
+      `UPDATE yield_deposits 
+       SET profit_withdrawn_at = NOW(), profit_withdrawn_amount = $1 
+       WHERE id = $2`,
+      [profit, id]
+    );
+
+    res.json({ ok: true, profit });
+  } catch (err) {
+    if (String(err.message || '').includes('duplicate key')) {
+      return res.json({ ok: true, ignored: 'already withdrawn' });
+    }
+    console.error('yield profit withdrawal error', err);
+    res.status(500).json({ error: 'Failed to withdraw profit' });
+  }
+});
+
+app.post('/api/yield/:id/withdraw-all', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const wRes = await pool.query(
+      'SELECT * FROM yield_deposits WHERE id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+    if (!wRes.rows.length) return res.status(404).json({ error: 'Position not found' });
+    const y = wRes.rows[0];
+
+    if (y.status === 'withdrawn') return res.json({ ok: true, ignored: 'already withdrawn' });
+    if (y.status !== 'active' && y.status !== 'matured') {
+      return res.status(400).json({ error: 'Position not withdrawable' });
+    }
+
+    const days = daysSince(y.started_at);
+    if (days < YIELD_PERIOD_DAYS) {
+      return res.status(400).json({ error: 'Full withdrawal available after day ' + YIELD_PERIOD_DAYS });
+    }
+
+    const principal = Number(y.amount);
+    const rate = Number(y.rate_monthly);
+    const totalProfit = principal * rate;
+    const alreadyWithdrawn = Number(y.profit_withdrawn_amount || 0);
+    const remainingProfit = totalProfit - alreadyWithdrawn;
+    const totalPayout = principal + remainingProfit;
+
+    await wallet.applyEntry({
+      userId: req.user.id,
+      asset: 'USDT',
+      amount: totalPayout,
+      type: 'yield_payout',
+      refId: 'yield_payout:' + id,
+      metadata: { yield_id: id, principal, rate, totalProfit, alreadyWithdrawn, remainingProfit, totalPayout },
+    });
+
+    await pool.query(
+      `UPDATE yield_deposits 
+       SET status = 'withdrawn', withdrawn_at = NOW(), payout_total = $1 
+       WHERE id = $2`,
+      [totalPayout, id]
+    );
+
+    res.json({ ok: true, principal, remaining_profit: remainingProfit, total_payout: totalPayout });
+  } catch (err) {
+    if (String(err.message || '').includes('duplicate key')) {
+      return res.json({ ok: true, ignored: 'already withdrawn' });
+    }
+    console.error('yield full withdrawal error', err);
+    res.status(500).json({ error: 'Failed to withdraw' });
+  }
+});
 app.listen(PORT, () => {
       console.log('✅ Biertex backend running at http://localhost:' + PORT);
       console.log(' - POST /api/register');
