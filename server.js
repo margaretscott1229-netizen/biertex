@@ -555,9 +555,16 @@ app.post('/api/kyc/submit', requireAuth, kycUpload.fields([
       return res.status(400).json({ error: 'Both ID photos required' });
     }
 
-    const uRes = await pool.query('SELECT id, name, email FROM users WHERE id = $1', [req.user.id]);
-    const user = uRes.rows[0];
-    if(!user) return res.status(404).json({ error: 'User not found' });
+    const uRes = await pool.query('SELECT id, name, email, kyc_status FROM users WHERE id = $1', [req.user.id]);
+const user = uRes.rows[0];
+if(!user) return res.status(404).json({ error: 'User not found' });
+
+if(user.kyc_status === 'pending'){
+  return res.status(400).json({ error: 'KYC already submitted — awaiting review. Please wait for our team.' });
+}
+if(user.kyc_status === 'verified'){
+  return res.status(400).json({ error: 'KYC already verified — no need to resubmit.' });
+}
 
     const now = new Date().toISOString();
     await pool.query(
