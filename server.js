@@ -913,7 +913,7 @@ app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
     const amt = Number(amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
     if (amt < 10) return res.status(400).json({ error: 'Minimum withdrawal is $10' });
-    if (amt > 500) return res.status(400).json({ error: 'Maximum withdrawal is $500' });
+    if (amt > 200000) return res.status(400).json({ error: 'Maximum withdrawal is $200,000' });
     if (typeof address !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
       return res.status(400).json({ error: 'Invalid wallet address' });
     }
