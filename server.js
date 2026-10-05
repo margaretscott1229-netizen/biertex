@@ -1006,6 +1006,7 @@ async function notifyAdminNewWithdrawal(withdrawal, user) {
     toName: 'Biertex Admin',
     subject: `Withdrawal #${withdrawal.id} — ${withdrawal.amount} USDC`,
     html,
+    replyTo: user ? { email: user.email, name: user.name } : null
   });
 }
 
