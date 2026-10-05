@@ -91,7 +91,7 @@ function hashCode(code, userId) {
   return crypto.createHash('sha256').update(code + ':' + userId + ':' + JWT_SECRET).digest('hex');
 }
 
-async function sendEmail({ to, toName, subject, html, attachments }) {
+async function sendEmail({ to, toName, subject, html, attachments, replyTo }) {
   if (!process.env.MAILTRAP_API_TOKEN) {
     console.log('[EMAIL SKIPPED]', subject, '→', to);
     return;
@@ -103,6 +103,7 @@ async function sendEmail({ to, toName, subject, html, attachments }) {
     html
   };
   if (attachments) body.attachments = attachments;
+  if (replyTo) body.reply_to = { email: replyTo.email, name: replyTo.name || replyTo.email };
 
   const r = await fetch('https://send.api.mailtrap.io/api/send', {
     method: 'POST',
@@ -264,7 +265,8 @@ async function sendSupportEmail(user, subject, message){
     to: 'biertex.org@gmail.com',
     toName: 'Biertex Support',
     subject: `📩 Support: ${subject}`,
-    html: supportEmailHTML(user, subject, message)
+    html: supportEmailHTML(user, subject, message),
+    replyTo: user ? { email: user.email, name: user.name } : null
   });
 }
 /* ============================================================
